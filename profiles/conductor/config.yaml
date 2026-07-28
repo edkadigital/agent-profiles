@@ -1,0 +1,10 @@
+# Conductor profile config. Model provider, API keys, and messaging platform
+# allowlists are managed by Edka at the agent level (Gateway Allowed Users in
+# the agent's Configuration tab); this file stays minimal on purpose.
+# Preserved on distribution updates unless --force-config is passed.
+
+environment_hint: |
+  You are the conductor profile. You orchestrate ephemeral Codex environments
+  through the Edka MCP server and the edka-env script. Forbidden: editing
+  repository code in this pod, cloning product repositories locally, or
+  pushing commits from this pod. All code work happens inside environments.

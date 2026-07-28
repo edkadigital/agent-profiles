@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Connect to an Edka Codex environment and execute work inside it.
+
+The connection grant (app-server endpoint + short-lived token) is fetched
+out of band with the conductor bearer from this process's environment. The
+credential is passed to the codex CLI through a child environment variable
+and is never printed, so it cannot enter the model transcript.
+
+Usage:
+  edka-env run <environment-id> <task text...>   Execute a task non-interactively
+  edka-env shell <environment-id>                Print the interactive command hint
+                                                 (for human operators, not the model)
+
+Exit codes: 0 success, 2 usage, 3 grant refused (message explains why),
+4 codex CLI missing, 5 connection/transport failure.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+GRANT_TIMEOUT_SECONDS = 30
+
+
+def _fail(code: int, message: str) -> "int":
+    print(f"edka-env: {message}", file=sys.stderr)
+    return code
+
+
+def _fetch_grant(environment_id: str) -> dict:
+    grant_base = os.environ.get("EDKA_MCP_GRANT_URL", "").rstrip("/")
+    bearer = os.environ.get("EDKA_MCP_TOKEN", "")
+    if not grant_base or not bearer:
+        raise RuntimeError(
+            "EDKA_MCP_GRANT_URL / EDKA_MCP_TOKEN are not set; the conductor "
+            "is not enabled on this agent or the pod needs a restart."
+        )
+    request = urllib.request.Request(
+        f"{grant_base}/environments/{environment_id}/connection",
+        method="POST",
+        headers={"Authorization": f"Bearer {bearer}"},
+        data=b"",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=GRANT_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        detail = ""
+        try:
+            body = json.loads(error.read().decode("utf-8"))
+            detail = str(body.get("message") or body.get("error") or "")
+        except Exception:
+            pass
+        if error.code == 401:
+            raise PermissionError(
+                "the conductor bearer was rejected; it may have been revoked "
+                "or the conductor disabled."
+            ) from error
+        if error.code == 404:
+            raise PermissionError(
+                "environment not found, or it was not created by this conductor."
+            ) from error
+        if error.code == 409:
+            raise PermissionError(
+                f"environment is not ready to connect yet ({detail or 'still provisioning'}); "
+                "poll env_status until it is running, then retry."
+            ) from error
+        raise RuntimeError(f"grant request failed with HTTP {error.code}: {detail}") from error
+    data = payload.get("data") or {}
+    endpoint = data.get("endpoint")
+    token = data.get("token")
+    if not endpoint or not token:
+        raise RuntimeError("grant response was missing the endpoint or token")
+    return {"endpoint": endpoint, "token": token, "expires_at": data.get("expiresAt")}
+
+
+def _codex_binary() -> str | None:
+    return shutil.which("codex")
+
+
+def run_task(environment_id: str, task: str) -> int:
+    if not task.strip():
+        return _fail(2, "task text is empty")
+    codex = _codex_binary()
+    if not codex:
+        return _fail(4, "the codex CLI is not installed in this pod")
+    try:
+        grant = _fetch_grant(environment_id)
+    except PermissionError as error:
+        return _fail(3, str(error))
+    except RuntimeError as error:
+        return _fail(5, str(error))
+
+    child_env = dict(os.environ)
+    child_env["EDKA_CODEX_TOKEN"] = grant["token"]
+    # Mirrors Edka's connection command: remote app-server, token via env.
+    command = [
+        codex,
+        "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--remote",
+        grant["endpoint"],
+        "--remote-auth-token-env",
+        "EDKA_CODEX_TOKEN",
+        task,
+    ]
+    try:
+        completed = subprocess.run(command, env=child_env, check=False)
+    except OSError as error:
+        return _fail(5, f"failed to launch codex: {error}")
+    return completed.returncode
+
+
+def shell_hint(environment_id: str) -> int:
+    try:
+        grant = _fetch_grant(environment_id)
+    except (PermissionError, RuntimeError) as error:
+        return _fail(3, str(error))
+    # Deliberately prints the endpoint but NOT the token: the interactive
+    # command re-fetches its own grant so nothing secret lands in a log.
+    print(
+        "Environment app-server: "
+        f"{grant['endpoint']} (grant valid until {grant.get('expires_at', 'unknown')}).\n"
+        "Interactive use is for human operators via the Edka console connection "
+        "dialog; this script only executes tasks."
+    )
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3:
+        print(__doc__, file=sys.stderr)
+        return 2
+    action, environment_id = argv[1], argv[2]
+    if action == "run":
+        return run_task(environment_id, " ".join(argv[3:]))
+    if action == "shell":
+        return shell_hint(environment_id)
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

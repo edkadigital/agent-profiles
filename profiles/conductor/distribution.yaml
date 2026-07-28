@@ -1,0 +1,22 @@
+name: conductor
+version: 0.1.0
+description: "Orchestrates Edka Codex environments from chat: implements features in coding environments, reviews pull requests in fresh read-only environments, and iterates until the work is approved."
+author: "Edka"
+license: "Apache-2.0"
+env_requires:
+  - name: EDKA_MCP_URL
+    description: "Edka conductor MCP endpoint. Injected by the Edka Hermes agent chart when Conductor is enabled."
+    required: true
+  - name: EDKA_MCP_GRANT_URL
+    description: "Edka connection-grant endpoint for driving environment app-servers. Injected by the Edka Hermes agent chart."
+    required: true
+  - name: EDKA_MCP_TOKEN
+    description: "Conductor bearer, delivered from the agent's config Secret. Never print or forward this value."
+    required: true
+distribution_owned:
+  - SOUL.md
+  - config.yaml
+  - mcp.json
+  - skills/
+  - scripts/
+  - distribution.yaml

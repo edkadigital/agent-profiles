@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "edka": {
+      "url": "${EDKA_MCP_URL}",
+      "headers": {
+        "Authorization": "Bearer ${EDKA_MCP_TOKEN}"
+      },
+      "enabled": true
+    }
+  }
+}
