@@ -3,32 +3,56 @@
 
 The connection grant (app-server endpoint + short-lived token) is fetched
 out of band with the conductor bearer from this process's environment. The
-credential is passed to the codex CLI through a child environment variable
-and is never printed, so it cannot enter the model transcript.
+credential is used only to open the WebSocket to the environment's codex
+app-server and is never printed, so it cannot enter the model transcript.
+
+Speaks the codex app-server JSON-RPC protocol (codex 0.125+, documented in
+codex-rs/app-server/README.md) directly over the WebSocket, rather than
+shelling out to the codex CLI: the CLI's `--remote` client mode exists only
+on its interactive TUI, never on `exec` (verified against 0.101.0-0.145.0),
+so there is no codex-CLI invocation that can drive a remote app-server
+non-interactively. This script is therefore intentionally stdlib-only Python
+with a minimal RFC 6455 WebSocket client — no codex CLI, no npm, no
+third-party package, needed in this pod for the `run` action.
+
+Environment pods bake `approval_policy = "never"` and
+`sandbox_mode = "danger-full-access"` into the app-server's own config at
+image build time, so turns never emit approval requests; this client does
+not implement an approval bridge.
 
 Usage:
   edka-env run <environment-id> <task text...>   Execute a task non-interactively
-  edka-env shell <environment-id>                Print the interactive command hint
+  edka-env shell <environment-id>                Print the connection endpoint
                                                  (for human operators, not the model)
 
 Exit codes: 0 success, 2 usage, 3 grant refused (message explains why),
-4 codex CLI missing, 5 connection/transport failure.
+5 connection/transport failure, 6 codex turn failed or timed out.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
-import shutil
-import subprocess
+import secrets
+import socket
+import ssl
+import struct
 import sys
+import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 GRANT_TIMEOUT_SECONDS = 30
+WORKSPACE_DIR = "/workspace"
+DEFAULT_TURN_TIMEOUT_SECONDS = 590
+_TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
-def _fail(code: int, message: str) -> "int":
+def _fail(code: int, message: str) -> int:
     print(f"edka-env: {message}", file=sys.stderr)
     return code
 
@@ -80,47 +104,295 @@ def _fetch_grant(environment_id: str) -> dict:
     return {"endpoint": endpoint, "token": token, "expires_at": data.get("expiresAt")}
 
 
-# Matches the codex version pinned in Edka's environment runtime; the CLI
-# drives the remote app-server, so client and server should track together.
-CODEX_CLI_VERSION = os.environ.get("EDKA_CODEX_CLI_VERSION", "0.145.0")
-LOCAL_PREFIX = "/opt/data/.local"
+class WebSocketError(RuntimeError):
+    pass
 
 
-def _codex_binary() -> str | None:
-    found = shutil.which("codex")
-    if found:
-        return found
-    local = os.path.join(LOCAL_PREFIX, "bin", "codex")
-    if os.access(local, os.X_OK):
-        return local
-    # Self-install onto the persistent volume (survives pod restarts). The
-    # hermes image ships node/npm; failure falls through to the exit-4 path.
-    npm = shutil.which("npm")
-    if not npm:
-        return None
-    print(
-        f"edka-env: installing codex CLI {CODEX_CLI_VERSION} to {LOCAL_PREFIX} (one-time setup)",
-        file=sys.stderr,
-    )
-    try:
-        subprocess.run(
-            [npm, "install", "-g", "--prefix", LOCAL_PREFIX, f"@openai/codex@{CODEX_CLI_VERSION}"],
-            check=True,
-            capture_output=True,
-            timeout=300,
+class _WebSocketConnection:
+    """Minimal RFC 6455 client: text frames only, client masks, no
+    extensions/compression. codex's app-server protocol is one JSON-RPC
+    object per WebSocket message, so no extra newline framing is needed."""
+
+    def __init__(self, url: str, headers: dict[str, str], timeout: float = 30) -> None:
+        parts = urlsplit(url)
+        if parts.scheme not in ("ws", "wss"):
+            raise WebSocketError(f"unsupported websocket scheme: {parts.scheme!r}")
+        host = parts.hostname
+        if not host:
+            raise WebSocketError("websocket URL is missing a host")
+        port = parts.port or (443 if parts.scheme == "wss" else 80)
+        path = parts.path or "/"
+        if parts.query:
+            path = f"{path}?{parts.query}"
+
+        raw = socket.create_connection((host, port), timeout=timeout)
+        raw.settimeout(timeout)
+        if parts.scheme == "wss":
+            context = ssl.create_default_context()
+            self._sock: socket.socket = context.wrap_socket(raw, server_hostname=host)
+        else:
+            self._sock = raw
+        self._buffer = b""
+
+        key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+        request_headers = {
+            "Host": f"{host}:{port}",
+            "Upgrade": "websocket",
+            "Connection": "Upgrade",
+            "Sec-WebSocket-Key": key,
+            "Sec-WebSocket-Version": "13",
+            **headers,
+        }
+        lines = [f"GET {path} HTTP/1.1"]
+        lines += [f"{name}: {value}" for name, value in request_headers.items()]
+        self._sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+
+        response = self._read_http_response()
+        status_line = response.split(b"\r\n", 1)[0].decode("ascii", "replace")
+        if " 101 " not in f" {status_line} ":
+            if " 401 " in f" {status_line} ":
+                raise WebSocketError(
+                    "websocket upgrade rejected (401): the connection grant token "
+                    "was refused by the environment"
+                )
+            raise WebSocketError(f"websocket upgrade failed: {status_line}")
+        expected_accept = base64.b64encode(
+            hashlib.sha1((key + _WS_GUID).encode("ascii")).digest()
+        ).decode("ascii")
+        if expected_accept.encode("ascii") not in response:
+            raise WebSocketError("websocket handshake Sec-WebSocket-Accept mismatch")
+
+    def _read_http_response(self) -> bytes:
+        data = self._buffer
+        while b"\r\n\r\n" not in data:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                raise WebSocketError("connection closed during websocket handshake")
+            data += chunk
+        head, _, rest = data.partition(b"\r\n\r\n")
+        self._buffer = rest
+        return head
+
+    def _recv_exact(self, count: int) -> bytes:
+        while len(self._buffer) < count:
+            chunk = self._sock.recv(max(4096, count - len(self._buffer)))
+            if not chunk:
+                raise WebSocketError("websocket connection closed unexpectedly")
+            self._buffer += chunk
+        data, self._buffer = self._buffer[:count], self._buffer[count:]
+        return data
+
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        header = bytearray([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header += struct.pack("!H", length)
+        else:
+            header.append(0x80 | 127)
+            header += struct.pack("!Q", length)
+        mask_key = secrets.token_bytes(4)
+        masked = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+        self._sock.sendall(bytes(header) + mask_key + masked)
+
+    def send_text(self, text: str) -> None:
+        self._send_frame(0x1, text.encode("utf-8"))
+
+    def _recv_frame(self) -> tuple[int, bytes, bool]:
+        first_two = self._recv_exact(2)
+        first_byte, second_byte = first_two[0], first_two[1]
+        fin = bool(first_byte & 0x80)
+        opcode = first_byte & 0x0F
+        masked = bool(second_byte & 0x80)
+        length = second_byte & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._recv_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._recv_exact(8))[0]
+        mask_key = self._recv_exact(4) if masked else None
+        payload = self._recv_exact(length)
+        if mask_key:
+            payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+        return opcode, payload, fin
+
+    def recv_message(self, timeout: float | None = None) -> str:
+        if timeout is not None:
+            self._sock.settimeout(timeout)
+        parts: list[bytes] = []
+        while True:
+            opcode, payload, fin = self._recv_frame()
+            if opcode == 0x8:
+                raise WebSocketError("websocket closed by the environment")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            parts.append(payload)
+            if fin:
+                break
+        return b"".join(parts).decode("utf-8")
+
+    def close(self) -> None:
+        try:
+            self._send_frame(0x8, b"")
+        except Exception:
+            pass
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+
+class CodexAppServerError(RuntimeError):
+    pass
+
+
+class _CodexAppServerClient:
+    """Thin JSON-RPC 2.0 driver over the WebSocket, mirroring the sequence
+    Hermes's own local (stdio) app-server client uses: initialize handshake,
+    thread/start, turn/start, drain notifications until turn/completed."""
+
+    def __init__(self, endpoint: str, token: str, timeout: float = 30) -> None:
+        self._ws = _WebSocketConnection(
+            endpoint, headers={"Authorization": f"Bearer {token}"}, timeout=timeout
         )
-    except (subprocess.SubprocessError, OSError) as error:
-        print(f"edka-env: codex CLI install failed: {error}", file=sys.stderr)
-        return None
-    return local if os.access(local, os.X_OK) else None
+        self._next_id = 1
+
+    def _send(self, obj: dict) -> None:
+        self._ws.send_text(json.dumps(obj))
+
+    def _new_id(self) -> int:
+        request_id = self._next_id
+        self._next_id += 1
+        return request_id
+
+    def request(self, method: str, params: dict, timeout: float) -> tuple[int, dict]:
+        """Send a request and return its id; the caller drains recv_json()
+        for the matching response (turn/start's response can arrive
+        interleaved with streaming notifications, so it cannot be waited
+        for in isolation)."""
+        request_id = self._new_id()
+        self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        return request_id, {}
+
+    def request_and_wait(self, method: str, params: dict, timeout: float) -> dict:
+        request_id, _ = self.request(method, params, timeout)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{method} did not respond within {timeout}s")
+            message = self.recv_json(timeout=remaining)
+            if message.get("id") == request_id and (
+                "result" in message or "error" in message
+            ):
+                if "error" in message:
+                    error = message["error"]
+                    raise CodexAppServerError(
+                        f"{method} failed: {error.get('code')} {error.get('message')}"
+                    )
+                return message.get("result") or {}
+
+    def notify(self, method: str, params: dict) -> None:
+        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def recv_json(self, timeout: float | None = None) -> dict:
+        return json.loads(self._ws.recv_message(timeout=timeout))
+
+    def close(self) -> None:
+        self._ws.close()
 
 
-def run_task(environment_id: str, task: str) -> int:
+def _run_codex_task(endpoint: str, token: str, task_text: str, turn_timeout: float) -> str:
+    client = _CodexAppServerClient(endpoint, token)
+    try:
+        client.request_and_wait(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "edka-conductor",
+                    "title": "Edka Conductor",
+                    "version": "1.0",
+                },
+                "capabilities": {},
+            },
+            timeout=30,
+        )
+        client.notify("initialized", {})
+
+        thread_result = client.request_and_wait(
+            "thread/start", {"cwd": WORKSPACE_DIR}, timeout=30
+        )
+        thread = thread_result.get("thread") or {}
+        thread_id = (
+            thread.get("id")
+            or thread.get("sessionId")
+            or thread_result.get("sessionId")
+            or thread_result.get("threadId")
+        )
+        if not thread_id:
+            raise CodexAppServerError(
+                f"thread/start returned no thread id (keys: {sorted(thread_result.keys())})"
+            )
+
+        turn_request_id, _ = client.request(
+            "turn/start",
+            {"threadId": thread_id, "input": [{"type": "text", "text": task_text}]},
+            timeout=turn_timeout,
+        )
+
+        deadline = time.monotonic() + turn_timeout
+        final_text: str | None = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"codex turn did not complete within {turn_timeout}s")
+            message = client.recv_json(timeout=remaining)
+            method = message.get("method")
+
+            if message.get("id") == turn_request_id and (
+                "result" in message or "error" in message
+            ):
+                if "error" in message:
+                    error = message["error"]
+                    raise CodexAppServerError(
+                        f"turn/start failed: {error.get('code')} {error.get('message')}"
+                    )
+                continue
+
+            if method == "item/completed":
+                item = (message.get("params") or {}).get("item") or {}
+                if item.get("type") == "agentMessage" and item.get("text"):
+                    final_text = item["text"]
+                    preview = final_text if len(final_text) <= 500 else f"{final_text[:500]}…"
+                    print(f"[codex] {preview}", file=sys.stderr)
+                    if any(marker in final_text for marker in _TURN_ABORTED_MARKERS):
+                        raise CodexAppServerError("codex reported turn_aborted")
+                continue
+
+            if method == "turn/completed":
+                turn = (message.get("params") or {}).get("turn") or {}
+                status = turn.get("status")
+                if status and status not in {"completed", "interrupted"}:
+                    error = turn.get("error") or {}
+                    raise CodexAppServerError(
+                        f"turn ended with status {status!r}: {error.get('message', '')}"
+                    )
+                break
+
+            # Other item/*, thread/*, or unrelated notifications: ignore.
+
+        return final_text or "(codex completed the turn without a final message)"
+    finally:
+        client.close()
+
+
+def run_task(environment_id: str, task: str, turn_timeout: float = DEFAULT_TURN_TIMEOUT_SECONDS) -> int:
     if not task.strip():
         return _fail(2, "task text is empty")
-    codex = _codex_binary()
-    if not codex:
-        return _fail(4, "the codex CLI is not installed in this pod")
     try:
         grant = _fetch_grant(environment_id)
     except PermissionError as error:
@@ -128,24 +400,14 @@ def run_task(environment_id: str, task: str) -> int:
     except RuntimeError as error:
         return _fail(5, str(error))
 
-    child_env = dict(os.environ)
-    child_env["EDKA_CODEX_TOKEN"] = grant["token"]
-    # Mirrors Edka's connection command: remote app-server, token via env.
-    command = [
-        codex,
-        "exec",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--remote",
-        grant["endpoint"],
-        "--remote-auth-token-env",
-        "EDKA_CODEX_TOKEN",
-        task,
-    ]
     try:
-        completed = subprocess.run(command, env=child_env, check=False)
-    except OSError as error:
-        return _fail(5, f"failed to launch codex: {error}")
-    return completed.returncode
+        result = _run_codex_task(grant["endpoint"], grant["token"], task, turn_timeout)
+    except (WebSocketError, TimeoutError, ConnectionError, OSError) as error:
+        return _fail(5, f"connection to the environment failed: {error}")
+    except CodexAppServerError as error:
+        return _fail(6, str(error))
+    print(result)
+    return 0
 
 
 def shell_hint(environment_id: str) -> int:
@@ -153,8 +415,9 @@ def shell_hint(environment_id: str) -> int:
         grant = _fetch_grant(environment_id)
     except (PermissionError, RuntimeError) as error:
         return _fail(3, str(error))
-    # Deliberately prints the endpoint but NOT the token: the interactive
-    # command re-fetches its own grant so nothing secret lands in a log.
+    # Deliberately prints the endpoint but NOT the token: a human operator
+    # connects through the Edka console's own connection dialog, which mints
+    # its own grant, so nothing secret needs to land in a log here.
     print(
         "Environment app-server: "
         f"{grant['endpoint']} (grant valid until {grant.get('expires_at', 'unknown')}).\n"
