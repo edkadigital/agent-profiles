@@ -80,8 +80,39 @@ def _fetch_grant(environment_id: str) -> dict:
     return {"endpoint": endpoint, "token": token, "expires_at": data.get("expiresAt")}
 
 
+# Matches the codex version pinned in Edka's environment runtime; the CLI
+# drives the remote app-server, so client and server should track together.
+CODEX_CLI_VERSION = os.environ.get("EDKA_CODEX_CLI_VERSION", "0.145.0")
+LOCAL_PREFIX = "/opt/data/.local"
+
+
 def _codex_binary() -> str | None:
-    return shutil.which("codex")
+    found = shutil.which("codex")
+    if found:
+        return found
+    local = os.path.join(LOCAL_PREFIX, "bin", "codex")
+    if os.access(local, os.X_OK):
+        return local
+    # Self-install onto the persistent volume (survives pod restarts). The
+    # hermes image ships node/npm; failure falls through to the exit-4 path.
+    npm = shutil.which("npm")
+    if not npm:
+        return None
+    print(
+        f"edka-env: installing codex CLI {CODEX_CLI_VERSION} to {LOCAL_PREFIX} (one-time setup)",
+        file=sys.stderr,
+    )
+    try:
+        subprocess.run(
+            [npm, "install", "-g", "--prefix", LOCAL_PREFIX, f"@openai/codex@{CODEX_CLI_VERSION}"],
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+    except (subprocess.SubprocessError, OSError) as error:
+        print(f"edka-env: codex CLI install failed: {error}", file=sys.stderr)
+        return None
+    return local if os.access(local, os.X_OK) else None
 
 
 def run_task(environment_id: str, task: str) -> int:
