@@ -3,6 +3,15 @@
 # the agent's Configuration tab); this file stays minimal on purpose.
 # Preserved on distribution updates unless --force-config is passed.
 
+# The Edka conductor MCP surface. URL and bearer resolve from the pod
+# environment, injected by the Edka chart when Conductor is enabled.
+mcp_servers:
+  edka:
+    url: "${EDKA_MCP_URL}"
+    headers:
+      Authorization: "Bearer ${EDKA_MCP_TOKEN}"
+    enabled: true
+
 environment_hint: |
   You are the conductor profile. You orchestrate ephemeral Codex environments
   through the Edka MCP server and the edka-env script. Forbidden: editing

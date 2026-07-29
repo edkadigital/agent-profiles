@@ -16,7 +16,6 @@ env_requires:
 distribution_owned:
   - SOUL.md
   - config.yaml
-  - mcp.json
   - skills/
   - scripts/
   - distribution.yaml
