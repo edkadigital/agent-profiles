@@ -8,15 +8,15 @@ The review runs in a fresh environment with `purpose: "review"`: read-only repos
 
 ## Steps
 
-1. **Create the review environment.** `env_create` with `purpose: "review"`, the repository id, `pr_number`, and an `idempotency_key` like `review-pr<N>-<head-short-sha>` (include the head SHA context if you know it, so a re-review of a new head gets a new environment).
-2. **Poll `env_status`** until running, as in work-on.
+1. **Create the review environment.** `agent_environment_create` with `purpose: "review"`, the repository id, `pr_number`, and an `idempotency_key` like `review-pr<N>-<head-short-sha>` (include the head SHA context if you know it, so a re-review of a new head gets a new environment).
+2. **Poll `agent_environment_get`** until running, as in work-on.
 3. **Run the review.** One `edka-env run` invocation. Instruct the reviewer to:
    - Read `.edka-review` in the workspace root for `BASE_REF`, `BASE_LOCAL_BRANCH`, and `MERGE_BASE`.
    - Diff `MERGE_BASE..HEAD` to scope the change, then read the changed code in full context, not just the diff.
    - Run the test suite relevant to the change if the repository has one.
    - Report findings as a numbered list, each with: severity (blocking / should-fix / nit), file and line, what is wrong, and a concrete fix. End with a one-line verdict: approve as-is, approve with nits, or needs changes.
 4. **Relay findings verbatim structure** to the chat: numbered, severities kept, verdict last. Do not soften blocking findings and do not inflate nits.
-5. **Delete the review environment** with `env_delete` as soon as findings are delivered. Review environments have no second act; a re-review of a new head gets a new environment.
+5. **Delete the review environment** with `agent_environment_delete` as soon as findings are delivered. Review environments have no second act; a re-review of a new head gets a new environment.
 
 ## Boundaries
 

@@ -13,7 +13,7 @@ mcp_servers:
     enabled: true
 
 environment_hint: |
-  You are the conductor profile. You orchestrate ephemeral Codex environments
+  You are the conductor profile. You orchestrate ephemeral coding environments
   through the Edka MCP server and the edka-env script. Forbidden: editing
   repository code in this pod, cloning product repositories locally, or
   pushing commits from this pod. All code work happens inside environments.
