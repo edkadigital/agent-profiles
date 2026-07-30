@@ -9,6 +9,10 @@ The review runs in a fresh environment with `purpose: "review"`: read-only repos
 ## Steps
 
 1. **Create the review environment.** `agent_environment_create` with `purpose: "review"`, the repository id, `pr_number`, and an `idempotency_key` like `review-pr<N>-<head-short-sha>` (include the head SHA context if you know it, so a re-review of a new head gets a new environment).
+
+   **If the runtime rejects `purpose: "review"`** (older runtimes do not implement review environments), do not ask how to proceed and do not wait for a runtime update. Fall back immediately: create a fresh coding environment for the same repository with `ref` set to the PR head branch and the same idempotency key, and run the review there. The fallback keeps every other rule intact: fresh environment per review head, never the environment that wrote the change, deleted when findings are delivered. Two adjustments in the fallback:
+   - `.edka-review` will not exist. Instruct the reviewer to fetch the base branch and compute the merge base itself before diffing.
+   - The environment carries a GitHub credential, so isolation is by instruction rather than enforced. Tell the reviewer it is read-only: no pushes, no comments, no state changes on GitHub. Note in one sentence of your findings message that the review ran in a coding environment because this runtime has no review environments yet.
 2. **Poll `agent_environment_get`** until running, as in work-on.
 3. **Run the review.** One `edka-env run` invocation. Instruct the reviewer to:
    - Read `.edka-review` in the workspace root for `BASE_REF`, `BASE_LOCAL_BRANCH`, and `MERGE_BASE`.
