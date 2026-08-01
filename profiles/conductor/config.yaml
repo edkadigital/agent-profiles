@@ -3,6 +3,13 @@
 # the agent's Configuration tab); this file stays minimal on purpose.
 # Preserved on distribution updates unless --force-config is passed.
 
+# The conductor's skills are distribution-owned and vetted: the review
+# discipline, verdict rules, and read-only boundaries live in them. Disable
+# Hermes's background skill self-rewrite so runs cannot drift them; propose
+# skill changes to the operator instead (they land via profile updates).
+skills:
+  creation_nudge_interval: 0
+
 # The Edka conductor MCP surface. URL and bearer resolve from the pod
 # environment, injected by the Edka chart when Conductor is enabled.
 mcp_servers:

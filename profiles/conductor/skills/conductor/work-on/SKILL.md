@@ -1,3 +1,8 @@
+---
+name: work-on
+description: Use this when the user asks for a code change - a feature, a bug fix, a refactor - to be implemented in a coding environment and delivered as a pull request.
+---
+
 # Work on a feature or fix
 
 Use this when the user asks for a code change: a feature, a bug fix, a refactor.

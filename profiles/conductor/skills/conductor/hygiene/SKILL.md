@@ -1,3 +1,8 @@
+---
+name: hygiene
+description: Rules for cleaning up coding and review environments - on session start, after tasks conclude, and when the concurrency limit is reached.
+---
+
 # Environment hygiene
 
 Environments cost real cluster resources. You created them; you clean them up.
