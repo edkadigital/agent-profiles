@@ -1,5 +1,5 @@
 name: conductor
-version: 0.2.0
+version: 0.3.0
 description: "Orchestrates Edka coding environments from chat: implements features in coding environments, reviews pull requests in fresh read-only environments, and iterates until the work is approved."
 author: "Edka"
 license: "Apache-2.0"
